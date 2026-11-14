@@ -80,7 +80,7 @@ func DecodeSnapshot(data []byte) (*Snapshot, error) {
 	// Guard against a crafted count that would force a huge map allocation
 	// before the (then-failing) reads — same protection as DecodeStateVectorV1.
 	if n > uint64(dec.Remaining()/2) || n > maxV2Items {
-		return nil, wrapUpdateErr(ErrInvalidUpdate)
+		return nil, ErrInvalidUpdate
 	}
 	sv := make(StateVector, n)
 	for i := uint64(0); i < n; i++ {
@@ -139,7 +139,7 @@ func SnapshotContainsUpdateV1(snap *Snapshot, update []byte) (bool, error) {
 	for client, items := range structs {
 		held := snap.StateVector.Clock(client)
 		for _, item := range items {
-			if item.ID.Clock+uint64(item.Content.Len()) > held {
+			if item.ID.Clock+item.Content.Len() > held {
 				return false, nil
 			}
 		}
@@ -168,20 +168,26 @@ func DocContainsUpdateV1(doc *Doc, update []byte) (bool, error) {
 	}
 	doc.mu.RLock()
 	defer doc.mu.RUnlock()
+	return storeContains(doc.store, structs, ds), nil
+}
+
+// storeContains reports whether store holds every struct and deletion of a
+// decoded update. Caller must hold the document lock.
+func storeContains(store *StructStore, structs map[ClientID][]*Item, ds DeleteSet) bool {
 	for client, items := range structs {
-		held := doc.store.NextClock(client)
+		held := store.NextClock(client)
 		for _, item := range items {
-			if item.ID.Clock+uint64(item.Content.Len()) > held {
-				return false, nil
+			if item.ID.Clock+item.Content.Len() > held {
+				return false
 			}
 		}
 	}
 	for client, ranges := range ds.clients {
-		if !storeDeletes(doc.store.clients[client], ranges) {
-			return false, nil
+		if !storeDeletes(store.clients[client], ranges) {
+			return false
 		}
 	}
-	return true, nil
+	return true
 }
 
 // storeDeletes reports whether every clock in ranges is held by a deleted
@@ -202,7 +208,7 @@ func storeDeletes(items []*Item, ranges []DeleteRange) bool {
 			if i < 0 || i >= len(items) || !items[i].Deleted || !itemHolds(items[i], clock) {
 				return false
 			}
-			clock = items[i].ID.Clock + uint64(items[i].Content.Len())
+			clock = items[i].ID.Clock + items[i].Content.Len()
 			if clock >= end {
 				break
 			}
@@ -228,7 +234,7 @@ func seekItem(items []*Item, from int, clock uint64) int {
 
 // itemHolds reports whether clock lies within item's clock range.
 func itemHolds(item *Item, clock uint64) bool {
-	return item.ID.Clock <= clock && clock < item.ID.Clock+uint64(item.Content.Len())
+	return item.ID.Clock <= clock && clock < item.ID.Clock+item.Content.Len()
 }
 
 // deleteSetCovers reports whether ds marks every clock in r deleted for
@@ -331,7 +337,8 @@ func encodeFromSnapshotLocked(doc *Doc, snap *Snapshot) []byte {
 			groups = append(groups, clientGroup{client, relevant})
 		}
 	}
-	sort.Slice(groups, func(i, j int) bool { return groups[i].client < groups[j].client })
+	// Yjs writes clients in descending order.
+	sort.Slice(groups, func(i, j int) bool { return groups[i].client > groups[j].client })
 
 	enc.WriteVarUint(uint64(len(groups)))
 	for _, g := range groups {
@@ -349,8 +356,8 @@ func encodeFromSnapshotLocked(doc *Doc, snap *Snapshot) []byte {
 	return enc.Bytes()
 }
 
-// gcTxnDeleteSet is the per-transaction counterpart to RunGC (#78 H1, v1.15.0).
-// Called from transactInternal under the doc lock, after buildPhase2 has
+// gcTxnDeleteSet is the per-transaction counterpart to RunGC.
+// Called from collectAndEncodeLocked under the doc lock, after buildPhase2 has
 // captured observer deltas. For every item tombstoned in this transaction,
 // replaces its Content with a length-only ContentDeleted placeholder so
 // long-running documents don't retain full content for items that will
@@ -377,7 +384,7 @@ func gcTxnDeleteSet(doc *Doc, txn *Transaction) {
 				if item.ID.Clock >= rangeEnd {
 					break
 				}
-				if item.ID.Clock+uint64(item.Content.Len()) <= r.Clock {
+				if item.ID.Clock+item.Content.Len() <= r.Clock {
 					continue
 				}
 				if !item.Deleted {
@@ -447,7 +454,7 @@ func RunGC(doc *Doc) {
 			if prevIsCDItem && itemIsCD &&
 				gcMergeable(prev, item) &&
 				prev.Right == item && item.Left == prev &&
-				prev.ID.Clock+uint64(prev.Content.Len()) == item.ID.Clock &&
+				prev.ID.Clock+prev.Content.Len() == item.ID.Clock &&
 				item.Origin != nil && item.Origin.Client == client && item.Origin.Clock == item.ID.Clock-1 &&
 				originIDEquals(prev.OriginRight, item.OriginRight) {
 				// Absorb item into prev: extend the tombstone length, rewire

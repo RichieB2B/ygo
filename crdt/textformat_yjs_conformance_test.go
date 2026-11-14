@@ -208,9 +208,9 @@ func textFormatUnits(t *testing.T, u []byte) []string {
 				for k := range cd.Len() {
 					origin := it.Origin
 					if k > 0 {
-						origin = &ID{Client: c, Clock: it.ID.Clock + uint64(k) - 1}
+						origin = &ID{Client: c, Clock: it.ID.Clock + k - 1}
 					}
-					out = append(out, fmt.Sprintf("%d:%d o=%s r=%s deleted", c, it.ID.Clock+uint64(k), id(origin), id(it.OriginRight)))
+					out = append(out, fmt.Sprintf("%d:%d o=%s r=%s deleted", c, it.ID.Clock+k, id(origin), id(it.OriginRight)))
 				}
 				continue
 			}
@@ -320,10 +320,9 @@ func TestConformance_TextFormat_MultiPeer(t *testing.T) {
 
 // Observers of a remote transaction see the formatting before its cleanup,
 // edits they make precede the cleanup, and the cleanup's events come last.
-// A transaction an observer starts fires its observers before returning,
-// where Yjs queues them after the cleanup, so for it only the event kinds
-// are compared, and the update order only when it starts after the remote
-// update was emitted.
+// A transaction an observer starts fires its observers and its update
+// before returning, where Yjs queues them after the cleanup, so for it only
+// the event kinds are compared, and the updates before the cleanup's as a set.
 func TestConformance_TextFormat_Observed(t *testing.T) {
 	for _, fx := range loadTextFormatFixtures(t).Observed {
 		t.Run(fx.Name, func(t *testing.T) {
@@ -402,14 +401,12 @@ func TestConformance_TextFormat_Observed(t *testing.T) {
 			if g, w := byTxn(got), byTxn(want); !reflect.DeepEqual(g, w) {
 				t.Errorf("events\n got=%q\nwant=%q", g, w)
 			}
-			if fx.Mode != "after" {
-				for _, u := range [][]string{gotUpdates, wantUpdates} {
-					n := len(u)
-					if n > 0 && u[n-1] == "cleanup" {
-						n--
-					}
-					slices.Sort(u[:n])
+			for _, u := range [][]string{gotUpdates, wantUpdates} {
+				n := len(u)
+				if n > 0 && u[n-1] == "cleanup" {
+					n--
 				}
+				slices.Sort(u[:n])
 			}
 			if !reflect.DeepEqual(gotUpdates, wantUpdates) {
 				t.Errorf("updates\n got=%q\nwant=%q", gotUpdates, wantUpdates)

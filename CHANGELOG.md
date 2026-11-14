@@ -5,6 +5,246 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.56.0] — 2026-10-31
+
+### Added
+
+- **`crdt.Doc.OnPersistUpdate`** reports newly parked changes as well as
+  integrated changes, so persistence can replay pending updates without
+  changing Yjs-compatible `OnUpdate` events. A callback queues a write; it
+  does not acknowledge durable storage.
+
+- **`crdt.ApplyUpdateV1Held(doc, update, origin)`** applies a V1 update as
+  `ApplyUpdateV1Landed` does and also reports whether the document already
+  held all of it, so that the apply changed and parked nothing. It decides
+  under the lock the apply holds. `provider/websocket` uses it to send a
+  peer's update on unless the room already held it, without decoding the
+  update a second time when the apply changes the document.
+
+### Fixed
+
+- **`crdt`: V1 encoders write clients in descending order, as Yjs does.**
+  The struct groups of a V1 update and the entries of a state vector were
+  written with clients ascending, so a V1 update or state vector with more
+  than one client was not byte-identical to Yjs's. This covers
+  `EncodeStateAsUpdateV1`, the `OnUpdate` update, `MergeUpdatesV1`,
+  `DiffUpdateV1`, `UpdateV2ToV1`, `EncodeStateFromSnapshot`,
+  `EncodeStateVectorV1`, `EncodeStateVectorFromUpdate`,
+  `EncodeStateVectorFromUpdateV2` and `EncodeSnapshot`. The V2 encoders and
+  the delete-set encoders already wrote clients descending.
+- **`crdt`: the update `OnUpdate` observers receive carries only the
+  transaction's deletions.** It carried the whole document's delete set, so
+  every update grew with the document's deletion history: after 1,000
+  separate deletions, a one-character insert gave a 2,951-byte update. It now
+  gives 12 bytes, as Yjs's `update` event does.
+  `provider/websocket`'s `Server.Apply` no longer returns `ErrUpdateTooLarge`
+  for a small edit to a room with a long deletion history.
+- **`crdt`: a transaction that changes nothing no longer calls `OnUpdate`.**
+  `OnUpdate` observers ran after every transaction, with an update of no
+  structs: an update the document already held, a delete of deleted content,
+  a delete set naming clocks the document lacks (which parks), and an empty
+  `Transact`. They now run only when the transaction adds structs or deletes
+  something, as Yjs emits its `update` event. A refused apply that integrated
+  part of its update still calls them for that part. `provider/websocket`
+  therefore does not relay-publish a no-op or send a peer's update to the
+  room's other peers when the room already held all of it. Newly parked
+  changes are stored through `OnPersistUpdate` and are still sent to peers, and `Server.Apply` returns `ErrNoChanges`
+  when `fn`'s transactions change nothing. `mobile` drops its filter for the
+  empty update.
+- **`crdt`: `OnUpdate` receives the update encoded after the transaction's
+  GC, as in Yjs.** ygo encoded the update before its GC, so content that one
+  transaction both inserted and deleted went out in full where Yjs sends a
+  `ContentDeleted` tombstone. A transaction that inserts "abc" and deletes
+  "b" now sends the same 24 bytes as Yjs, not 25. This holds for local
+  transactions and remote applies, also when the remote change is to a text
+  that an observer watches or that has format markers: that change is now
+  collected at commit too, and its format cleanup reads what it needs from
+  before the GC. With GC off, or with an `UndoManager` attached, the update
+  does not change. The update `ApplyUpdateV1Landed` returns for a failed
+  apply is now encoded at commit too, after the GC and the end-of-transaction
+  merges. It also includes newly parked structs and deletions, which are
+  absent from the Yjs-compatible `OnUpdate` update.
+- **`crdt`: `OnAfterTransaction` fires before `OnUpdate`, as Yjs emits
+  `afterTransaction` before `update`.** A committed transaction now calls
+  per-type observers, deep observers, `OnAfterTransaction`, `OnUpdate`, then
+  `OnSubdocs`, for local and applied updates alike. A transaction started
+  inside an `OnAfterTransaction` callback now emits its update before the
+  outer transaction's update, as one started inside an observer already did.
+  Yjs queues such a transaction until the outer one is done.
+- **`crdt`: a panicking observer no longer stops the other observers.** When
+  an observer panicked, no observer after it ran: not the other observers of
+  the same type, not deep observers, and not `OnUpdate`, so the update of the
+  transaction was lost to relays and persistence. Now every per-type, deep,
+  `OnAfterTransaction`, `OnUpdate` and `OnSubdocs` observer runs, and the
+  panic then reaches the caller, as Yjs runs its type and deep observers. If
+  more than one panics, the last panic reaches the caller, as in Yjs.
+- **`crdt`: a write into a deleted nested type no longer calls its
+  observers.** A write into a nested type after it was deleted, or in the
+  transaction that deleted it, called that type's `Observe` and `ObserveDeep`
+  callbacks and the `ObserveDeep` callbacks of its ancestors. This happened
+  for a local write through a held handle and, with GC off, for a remote
+  write that a peer made before it saw the deletion. Deleting a type that had
+  children also called its own `Observe` and `ObserveDeep`. Yjs calls none of
+  these, and now ygo does not either. The deletion still calls the observers
+  of the type that lost the entry and the deep observers of its live
+  ancestors.
+- **`crdt`: observers of the types one transaction changed fire in a fixed
+  order, the one Yjs uses.** `Observe` callbacks fire in the order the
+  transaction first changed each type, and `ObserveDeep` callbacks in that
+  order with each type's ancestors after it. ygo took this order from a Go
+  map, so it changed from one run to the next. An applied update changes its
+  types in the order its structs integrate, then in the order of its
+  deletions, as in Yjs.
+- **`crdt`: a text whose own observer panics no longer starts the remote
+  format cleanup.** After a remote change, ygo deletes the format markers that
+  the change left redundant. A formatted text was cleaned even when its own
+  observer panicked, and a panic in any type observer could skip the cleanup
+  for every text. Now the decision waits for the type observers even when one
+  panics, and leaves out each text whose own observer panicked, as in Yjs. Any
+  other changed text with formatting still starts the cleanup.
+- **`crdt`: `YText.Delete` and an `ApplyDelta` delete clean up format markers
+  as Yjs does (#297).** After a deletion, Yjs's `deleteText` looks at the
+  markers from the deleted range to the next character. It deletes each
+  marker that a later marker of the same key overrides, and each marker that
+  sets the value the attribute had before the deleted range. `YText.Delete`
+  used a different rule: it kept some of these markers and deleted some that
+  Yjs keeps. `ApplyDelta`'s delete deleted no markers. So the same edits gave
+  a document with different markers in ygo and in Yjs, and text that a peer
+  inserted next to such a marker at the same time could get different
+  formatting. Both now use Yjs's rule. As in Yjs, the cleanup also compares an
+  object or array attribute value by identity, so a marker that restores such
+  a value matches the marker it was copied from.
+
+### Performance
+
+- **`crdt`: delete sets sort without allocating.** `DeleteSet.sortAndCompact`
+  and the V1 and V2 delete-set encoders sorted with `sort.Slice`, which
+  allocates three times per call; they now use `slices.SortFunc`. The output
+  is unchanged.
+- **`crdt`: the delete set of a full-state encode or snapshot is built in one
+  pass.** Each client's ranges are built in clock order and stored once, as
+  Yjs's `createDeleteSetFromStructStore` does, in place of one map write per
+  deleted item and a sort per client. The bytes do not change.
+- **`crdt`: encoding against a state vector skips the items the peer has by
+  binary search.** `EncodeStateAsUpdateV1`, `EncodeStateAsUpdateV2` and each
+  transaction's `OnUpdate` encode called `Content.Len` on every item of every
+  client and copied the matches; a client's items past the state vector are a
+  suffix of its clock-sorted items, now found with `sort.Search`, as Yjs's
+  `writeStructs` does. The bytes do not change.
+## [1.56.0] — 2026-11-01
+
+### Added
+
+- **`crdt`: `Doc.SetMaxPendingItems(n)`** sets the pending cap after
+  construction, so stored state over a cap can load first.
+
+### Changed
+
+- **`crdt` (breaking): `Content.Len()` returns `uint64`, and
+  `Content.Splice(offset)` takes `uint64`.** Custom content implementations
+  must change both method signatures. Callers that use these lengths as
+  string or slice indices must check their bounds before conversion to `int`.
+  `NewContentDeleted`, `NewContentMove`, and `ContentMove.TargetLen` also use
+  `uint64` lengths. Rendered text and array positions remain `int`.
+
+- **`crdt` (breaking): a document whose own client's clock is advanced by a
+  non-local transaction takes a new random client ID when that transaction
+  commits.** Anyone who sets `WithClientID` and re-applies their own updates
+  must read `ClientID()` again after doing so. This breaks the documented
+  contract of `WithClientID` (a fixed, deterministic ID) and of `ClientID`
+  (read-only after creation). It is Yjs's `cleanupTransactions` rule, so a
+  local write never continues a clock that another peer set. Before, a peer
+  could send a GC struct over the document's own client, and the next local
+  write continued that clock, past 2^53-1 if the GC struct reached it; this
+  release's clock bound refuses that state.
+
+### Fixed
+
+- **`crdt`: logical span lengths and offsets do not depend on the build's
+  integer width.** Coalesced GC and deleted spans retain their lengths on
+  32-bit builds. V1 and V2 accept the same wide spans, including offsets
+  inside them. String and list allocation limits remain in force.
+
+- **`crdt`: an update that would park past `WithMaxPendingItems` is refused
+  before it changes anything.** The cap was checked while the apply
+  integrated, so a refused update could leave part of itself in the document
+  and tell its observers. The check now runs before the first change. For an
+  update cut short before the struct that takes it past the cap, the refusal
+  names the decoder's reason. An apply that fails after it began to integrate
+  drains the pending queue on what it kept.
+- **`crdt`: parked delete ranges are capped and refused before any change.**
+  `WithMaxPendingItems` also bounds, separately, the delete ranges waiting for
+  structs the document lacks, and a client's parked ranges are retried only
+  once its structs move past the lowest of them.
+- **`crdt`: the pending queue merges a struct sent again as Yjs merges its
+  pending update.** Of the structs that give one clock, the one that Yjs's
+  merge takes first keeps it, and the queue drops or cuts the others. The
+  pending cap counts what the park adds after the merge, and a queue above a
+  lowered cap does not grow. Each struct a park adds, cuts or drops costs, on
+  average, time logarithmic in the queue.
+- **`crdt`: an update checks only the clients whose clocks it advances when
+  deciding whether to retry parked structs.** An update that wakes nothing
+  no longer scans every client that the queue waits on.
+- **`crdt`: a struct the document already holds waits on an origin, right
+  origin or parent of another client that the document lacks, as Yjs
+  `getMissing` does,** and parks with every struct of its client after it.
+- **`crdt`: an item whose right origin is a GC struct, or a parked item whose
+  origin is one, integrates as a GC struct, as Yjs `getMissing` makes it.**
+- **`crdt`: an item that names a struct of its own client past that client's
+  clock is refused, as Yjs throws for it.**
+- **`crdt`: clocks past 2^53-1, and struct, origin and parent clients past
+  2^55-1, are refused.** Both decoders and the merge decoders refuse them, so
+  `EncodeStateAsUpdateV2` cannot meet a struct it cannot write, and encoding
+  parked state keeps every part that merges. The attribution decoders
+  (`DecodeIDSet`, `DecodeIDMap`, `DecodeContentIDs`, `DecodeContentMap`)
+  refuse an `IDMap` client past 2^55-1 and a range whose running clock would
+  pass 2^64-1, so the clock cannot wrap onto a low clock.
+- **`crdt`: `ApplyUpdateV1Landed` carries the structs and delete ranges a
+  failed apply parked.** A peer that applies the update it returns parks what
+  the document parks.
+- **`provider/websocket`: `Server.Inject` relays to local peers what a partly
+  applied update left in the room** before it returns the apply's error.
+- **`crdt`: a parked struct that panics in the drain is dropped, not the
+  structs after it.** The apply returns the panic as its error.
+- **`crdt`: an item that continues its client's GC struct is refused, as in
+  Yjs.**
+- **`crdt`: the deletions read before a cut in the delete set, or before a
+  range that reaches a clock past 2^53-1, stay applied, as in Yjs for a cut,
+  whatever the pending cap,** and the delete-set decoders no longer cap the
+  client and range counts. The apply returns its error, and
+  `ApplyUpdateV1Landed` carries those deletions.
+- **`crdt`: an item that arrives with deleted content is deleted when it
+  integrates, as in Yjs,** and a V2 GC struct adds nothing to the
+  transaction's delete set.
+- **`crdt`: `EncodeStateVectorFromUpdate` and `EncodeStateVectorFromUpdateV2`
+  return the state vector Yjs returns,** and a V1 subdocument whose guid is
+  not UTF-8 is an error rather than a panic.
+- **`crdt`: an update's structs integrate in Yjs's order,** and the
+  integration stops at the first refused struct, as Yjs stops.
+- **`crdt`: every struct of an update decodes before one integrates,** so a
+  struct that does not decode leaves the document unchanged.
+- **`crdt`: `WithClientID` panics for a client ID past 2^55-1,** the largest
+  a V2 update can carry.
+- **`crdt`: a type ref above 6 is refused before any change,** as Yjs
+  refuses it.
+- **`crdt`: `YArray.Insert` and `YArray.Push` with no values make no item,**
+  as in Yjs. They made an item of length zero, which the full state of the
+  document then carried.
+- **`crdt`: an item or GC struct of length zero is refused before any
+  change.** Yjs never writes one. When Yjs applies a zero-length map item, it
+  deletes the key's value and breaks that document's later encoding. The
+  apply also refuses an update from an older ygo that holds one. The merge
+  and conversion functions drop such a struct, and the bundled persistence
+  adapters merge a room's records on load, so a state that ygo 1.55.0 or
+  earlier stored with one still loads.
+- **`crdt`: a delete set read from an update allocates in proportion to its
+  bytes.** A counting first pass lets the decoders size the map, the order
+  list and each client's ranges once, from counts that the bytes bound. The
+  apply no longer copies the ranges it only reads. In tests with seven
+  crafted delete sets of about 1 MiB, 1.55.0 allocated up to 137.3 times
+  their bytes. 1.56.0 allocates at most 17.2 times at the default cap, and
+  30.3 times with the cap lifted, where the document keeps its own copy.
+
 ## [1.55.0] — 2026-10-31
 
 ### Added

@@ -111,11 +111,11 @@ This guarantees identical final state on all replicas regardless of message arri
 
 ### Pending-structs queue
 
-When an update references an item whose dependency hasn't arrived yet — a same-client clock gap or a cross-update Origin reference — the item is parked in a per-doc pending queue rather than silently orphaned. The queue drains automatically on each subsequent `ApplyUpdate` when the missing predecessors arrive. This mirrors Yjs JS's `pendingStructs` and yrs's `Store.pending`. See the v1.2.0 CHANGELOG entry for the design.
+When an update references an item whose dependency hasn't arrived yet — a same-client clock gap or a cross-update Origin reference — the item is parked in a per-doc pending queue rather than silently orphaned. The queue drains automatically on each subsequent `ApplyUpdate` when the missing predecessors arrive. A struct that arrives again while the queue holds it, as a reconnecting peer re-sends what it has not seen acknowledged, is not parked again: the queue holds each clock once, as Yjs's merged `pendingStructs` does. This mirrors Yjs JS's `pendingStructs` and yrs's `Store.pending`. See the v1.2.0 CHANGELOG entry for the design.
 
 The same machinery handles delete-set entries that target not-yet-integrated items (`pendingDs`). State-vector computation is unaffected — pending items don't appear in `StateVector()` until they're integrated, so peers correctly retry the missing dependencies.
 
-The queue is bounded (default 100,000 parked items; configurable via `crdt.WithMaxPendingItems` or `Server.MaxPendingItems`). Updates that would push past the cap return `ErrInvalidUpdate` — see the v1.8.0 CHANGELOG and #46 for the security rationale.
+The queue is bounded (default 100,000 parked items; configurable via `crdt.WithMaxPendingItems` or `Server.MaxPendingItems`). An update that would push past the cap returns `ErrInvalidUpdate` and leaves the document unchanged: the apply checks the whole update against the cap before it integrates any of it (`pendingBudget.checkBeforeApply`). See the v1.8.0 CHANGELOG and #46 for the security rationale. The same cap bounds, separately, the delete ranges parked waiting for the structs they delete, also checked before the apply integrates anything (`checkParkedDeletes`); a client's parked ranges are retried only once its structs have moved past the lowest of them, so an apply that brings nothing for that client costs nothing for them.
 
 ### DeleteSet
 
@@ -129,10 +129,10 @@ Lifecycle:
 1. Collect all inserts and deletes.
 2. Squash consecutive same-client items (run-length optimisation).
 3. Fire `beforeObserverCalls`.
-4. Fire `observe()` on each changed type.
-5. Fire `observeDeep()` recursively.
+4. Fire `observe()` on each changed type, in the order the transaction first changed it.
+5. Fire `observeDeep()` on each changed type and then its ancestors, in that order.
 6. Fire `afterTransaction`.
-7. Emit the binary update event for the transport layer.
+7. Emit the binary update event for the transport layer, only for a transaction that adds or deletes something.
 
 ### Doc
 
@@ -253,7 +253,7 @@ Callbacks cross the boundary as **interfaces** (`DocObserver`, `AwarenessObserve
 
 GC is on by default and is configured at construction — `crdt.New(crdt.WithGC(false))` preserves full history for snapshots and undo/redo. There is no settable `GC` field on `Doc`.
 
-**Automatic.** With GC enabled, each transaction frees the content of the items it deleted, at commit, after observer deltas have been computed and before the document lock is released — so no goroutine ever observes a partially collected state. Auto-GC is **suspended while any `UndoManager` is registered**: undoing a deletion re-inserts a copy of the deleted item's content, which requires that content still to be present. Yjs solves this with a per-item keep flag; ygo takes the conservative position of disabling automatic collection entirely for the lifetime of the undo manager.
+**Automatic.** With GC enabled, each transaction frees the content of the items it deleted, at commit, after observer deltas have been computed and before the document lock is released — so no goroutine ever observes a partially collected state. The update `OnUpdate` receives is encoded after this collection, as in Yjs, so content that one transaction both inserts and deletes is sent as a `ContentDeleted` tombstone. Auto-GC is **suspended while any `UndoManager` is registered**: undoing a deletion re-inserts a copy of the deleted item's content, which requires that content still to be present. Yjs solves this with a per-item keep flag; ygo takes the conservative position of disabling automatic collection entirely for the lifetime of the undo manager.
 
 **Manual — tombstone reclamation.** `crdt.RunGC(doc)` is the explicit entry point, and remains available when auto-GC is suspended. It does two passes: it replaces deleted item content with lightweight `ContentDeleted` tombstones, then **merges adjacent tombstones from the same client into single nodes**, compacting the linked list so future origin lookups traverse fewer items. Both the structural position information CRDT correctness depends on and the tombstone lengths survive; only the content is discarded. `RunGC` is a no-op when GC is disabled.
 
